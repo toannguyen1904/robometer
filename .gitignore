@@ -5,3 +5,4 @@ unsloth_compiled_cache/*
 *.pyc
 venv_robodopamine.txt
 baseline_eval_output/*
+/scripts/example_videos/*
