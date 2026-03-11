@@ -21,10 +21,13 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import imageio.v2 as imageio
 import numpy as np
 import requests
+from PIL import Image
 
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 
 def create_combined_progress_success_plot(
@@ -136,6 +139,143 @@ def create_combined_progress_success_plot(
 
     plt.tight_layout()
     return fig
+
+
+def create_synchronized_visualization_video(
+    frames: np.ndarray,
+    progress_pred: np.ndarray,
+    out_video_path: str,
+    fps: float,
+    success_probs: Optional[np.ndarray] = None,
+    title: Optional[str] = None,
+) -> str:
+    """
+    Create a vertically stacked video:
+      1) Original robot frame
+      2) Progress curve (up to current frame)
+      3) Success probability curve (up to current frame)
+    """
+    if frames.ndim != 4:
+        raise ValueError(f"Expected frames with shape (T,H,W,C), got {frames.shape}")
+
+    num_frames = int(frames.shape[0])
+    if num_frames == 0:
+        raise ValueError("Cannot create visualization video from empty frame array.")
+
+    if progress_pred.size == 0:
+        raise ValueError("Cannot create visualization video with empty progress predictions.")
+
+    has_success_probs = success_probs is not None and success_probs.size > 0
+    if has_success_probs:
+        T = min(num_frames, int(progress_pred.shape[0]), int(success_probs.shape[0]))
+    else:
+        T = min(num_frames, int(progress_pred.shape[0]))
+    if T <= 0:
+        raise ValueError("No overlapping timesteps between frames and predictions.")
+
+    frames = frames[:T]
+    progress_pred = progress_pred[:T]
+    success_probs_use = success_probs[:T] if has_success_probs else None
+
+    height, width = int(frames.shape[1]), int(frames.shape[2])
+    plot_panel_height = max(180, height // 2)
+    plots_height = 2 * plot_panel_height
+    dpi = 100
+    fig_w = width / dpi
+    fig_h = plots_height / dpi
+
+    fig, axs = plt.subplots(2, 1, figsize=(fig_w, fig_h), dpi=dpi, sharex=True)
+    ax_progress, ax_success = axs
+
+    canvas = FigureCanvasAgg(fig)
+    x = np.arange(T)
+
+    # Progress subplot.
+    (progress_line,) = ax_progress.plot([], [], color="tab:blue", linewidth=2, label="Progress")
+    progress_cursor = ax_progress.axvline(0, color="tab:red", linestyle="--", linewidth=1.5, label="Current Frame")
+    ax_progress.set_ylabel("Progress")
+    ax_progress.set_ylim(-0.05, 1.05)
+    ax_progress.set_xlim(0, max(T - 1, 1))
+    ax_progress.spines["right"].set_visible(False)
+    ax_progress.spines["top"].set_visible(False)
+    ax_progress.legend(loc="upper left")
+
+    # Success probability subplot.
+    if success_probs_use is not None:
+        (success_line,) = ax_success.plot([], [], color="purple", linewidth=2, label="Success Prob")
+        success_cursor = ax_success.axvline(0, color="tab:red", linestyle="--", linewidth=1.5, label="Current Frame")
+        ax_success.legend(loc="upper left")
+    else:
+        success_line = None
+        success_cursor = None
+        ax_success.text(
+            0.02,
+            0.5,
+            "Success probability not available",
+            transform=ax_success.transAxes,
+            fontsize=10,
+            va="center",
+        )
+    ax_success.set_ylabel("Success Prob")
+    ax_success.set_ylim(-0.05, 1.05)
+    ax_success.set_xlim(0, max(T - 1, 1))
+    ax_success.spines["right"].set_visible(False)
+    ax_success.spines["top"].set_visible(False)
+    ax_success.set_xlabel("Frame")
+
+    fig.suptitle(title or "Synchronized Progress/Success Visualization")
+    fig.tight_layout()
+
+    out_video = Path(out_video_path)
+    out_video.parent.mkdir(parents=True, exist_ok=True)
+    output_fps = float(fps) if fps and fps > 0 else 1.0
+
+    # yuv420p requires even dimensions for broad player compatibility.
+    final_width = width if width % 2 == 0 else width + 1
+    final_height = (height + plots_height) if (height + plots_height) % 2 == 0 else (height + plots_height + 1)
+
+    writer = imageio.get_writer(
+        str(out_video),
+        fps=output_fps,
+        codec="libx264",
+        format="FFMPEG",
+        ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+    )
+
+    try:
+        for t in range(T):
+            progress_line.set_data(x[: t + 1], progress_pred[: t + 1])
+            progress_cursor.set_xdata([t, t])
+            if success_line is not None and success_probs_use is not None and success_cursor is not None:
+                success_line.set_data(x[: t + 1], success_probs_use[: t + 1])
+                success_cursor.set_xdata([t, t])
+
+            canvas.draw()
+            plot_rgba = np.asarray(canvas.buffer_rgba())
+            plot_rgb = plot_rgba[:, :, :3]
+
+            frame_rgb = frames[t]
+            if frame_rgb.ndim == 2:
+                frame_rgb = np.stack([frame_rgb] * 3, axis=-1)
+            if frame_rgb.shape[-1] == 1:
+                frame_rgb = np.repeat(frame_rgb, repeats=3, axis=-1)
+            if frame_rgb.dtype != np.uint8:
+                frame_rgb = np.clip(frame_rgb, 0, 255).astype(np.uint8)
+
+            if plot_rgb.shape[1] != width or plot_rgb.shape[0] != plots_height:
+                plot_rgb = np.array(Image.fromarray(plot_rgb).resize((width, plots_height), Image.Resampling.BILINEAR))
+
+            combined_rgb = np.concatenate([frame_rgb, plot_rgb], axis=0)
+            if combined_rgb.shape[1] != final_width or combined_rgb.shape[0] != final_height:
+                padded = np.zeros((final_height, final_width, 3), dtype=np.uint8)
+                padded[: combined_rgb.shape[0], : combined_rgb.shape[1], :] = combined_rgb
+                combined_rgb = padded
+            writer.append_data(combined_rgb)
+    finally:
+        writer.close()
+        plt.close(fig)
+
+    return str(out_video)
 
 
 def extract_frames(video_path: str, fps: float = 1.0) -> np.ndarray:
@@ -431,6 +571,12 @@ def main() -> None:
         default=None,
         help="Output path for rewards .npy (default: <video_stem>_rewards.npy)",
     )
+    parser.add_argument(
+        "--out-video",
+        type=str,
+        default=None,
+        help="Output path for synchronized visualization .mp4 (default: <video_stem>_rewards_progress_success.mp4)",
+    )
     args = parser.parse_args()
 
     video_path = Path(args.video)
@@ -465,12 +611,29 @@ def main() -> None:
     fig.savefig(str(plot_path), dpi=200)
     plt.close(fig)
 
+    viz_video_path = Path(args.out_video) if args.out_video is not None else out_path.with_name(
+        out_path.stem + "_progress_success.mp4"
+    )
+    try:
+        out_viz_video = create_synchronized_visualization_video(
+            frames=frames,
+            progress_pred=rewards,
+            success_probs=success_probs if show_success else None,
+            out_video_path=str(viz_video_path),
+            fps=float(args.fps),
+            title=f"Progress/Success Over Time — {video_path.name}",
+        )
+    except Exception as e:
+        out_viz_video = None
+        print(f"Warning: failed to create synchronized visualization video: {e}")
+
     summary = {
         "video": str(video_path),
         "num_frames": int(frames.shape[0]),
         "out_npy": str(out_path),
         "out_success_probs_npy": str(success_path),
         "out_plot_png": str(plot_path),
+        "out_visualization_mp4": out_viz_video,
         "reward_min": float(np.min(rewards)) if rewards.size else None,
         "reward_max": float(np.max(rewards)) if rewards.size else None,
         "reward_mean": float(np.mean(rewards)) if rewards.size else None,

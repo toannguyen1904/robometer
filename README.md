@@ -89,7 +89,14 @@ uv run python robometer/evals/eval_server.py \
 Then run the client (no robometer dependency):
 
 ```bash
-# SOAR
+# ABEval
+uv run python scripts/example_inference.py \
+  --eval-server-url http://localhost:8000 \
+  --video scripts/example_videos/ab_eval.mp4 \
+  --task "Take the glove off the purple cylinder and place it on the orange plate" \
+  --fps 3
+
+#SOAR
 uv run python scripts/example_inference.py \
   --eval-server-url http://localhost:8000 \
   --video scripts/example_videos/soar_put_green_stick_in_brown_bowl.mp4 \
